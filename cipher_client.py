@@ -75,14 +75,32 @@ API_KEY = os.environ.get("CIPHER_API_KEY")
 KEY_DIR = Path.home() / ".cipher_messaging"
 HKDF_INFO = b"cipher-messaging-cek-wrap-v1"
 
-if not API_KEY:
-    raise SystemExit(
-        "Set CIPHER_API_KEY to the API_KEY you configured on your server "
-        "(and CIPHER_API_URL to your deployed URL, e.g. "
-        "https://your-service.onrender.com — defaults to localhost)."
-    )
 
-HEADERS = {"x-api-key": API_KEY, "Content-Type": "application/json"}
+class CipherClientError(Exception):
+    """Raised for expected, user-facing problems (bad config, missing key,
+    unknown recipient, etc). Callers such as the GUI can catch this
+    specifically instead of crashing, unlike SystemExit which is meant
+    only for a command-line process exiting."""
+
+
+def configure(base_url: str | None = None, api_key: str | None = None) -> None:
+    """Set the server URL / API key at runtime (used by the GUI's connect
+    dialog). Falls back to CIPHER_API_URL / CIPHER_API_KEY env vars if
+    never called."""
+    global BASE_URL, API_KEY
+    if base_url:
+        BASE_URL = base_url.rstrip("/")
+    if api_key:
+        API_KEY = api_key
+
+
+def _headers() -> dict:
+    if not API_KEY:
+        raise CipherClientError(
+            "No server configured. Set CIPHER_API_KEY (and optionally "
+            "CIPHER_API_URL) as environment variables, or call configure()."
+        )
+    return {"x-api-key": API_KEY, "Content-Type": "application/json"}
 
 
 # --------------------------------------------------------------------------
@@ -94,19 +112,19 @@ def _url(path: str) -> str:
 
 
 def api_get(path: str, params: dict | None = None) -> dict | list:
-    resp = requests.get(_url(path), headers=HEADERS, params=params, timeout=30)
+    resp = requests.get(_url(path), headers=_headers(), params=params, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def api_post(path: str, payload: dict) -> dict:
-    resp = requests.post(_url(path), headers=HEADERS, json=payload, timeout=30)
+    resp = requests.post(_url(path), headers=_headers(), json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def api_put(path: str, payload: dict) -> dict:
-    resp = requests.put(_url(path), headers=HEADERS, json=payload, timeout=30)
+    resp = requests.put(_url(path), headers=_headers(), json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -139,8 +157,8 @@ def save_private_key(email: str, private_key: ec.EllipticCurvePrivateKey) -> Non
 def load_private_key(email: str) -> ec.EllipticCurvePrivateKey:
     path = _key_path(email)
     if not path.exists():
-        raise SystemExit(
-            f"No local private key for {email}. Run 'register {email}' first."
+        raise CipherClientError(
+            f"No local private key for {email}. Register/create this identity first."
         )
     pem = path.read_bytes()
     return serialization.load_pem_private_key(pem, password=None)
@@ -198,7 +216,7 @@ def fetch_public_key(email: str) -> ec.EllipticCurvePublicKey:
         result = api_get(f"/identities/{quote(email, safe='')}")
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
-            raise SystemExit(f"No published Identity for {email}. Have they registered?")
+            raise CipherClientError(f"No published Identity for {email}. Have they registered?")
         raise
     return load_public_key_from_b64(result["public_key"])
 
@@ -231,8 +249,14 @@ def create_conversation(creator_email: str, participants: list[str], name: str |
     return result["id"]
 
 
+def list_conversations_data(email: str) -> list[dict]:
+    """Data-returning version for programmatic use (e.g. the GUI)."""
+    return api_get("/conversations", params={"participant": email})
+
+
 def list_conversations(email: str) -> None:
-    convos = api_get("/conversations", params={"participant": email})
+    """CLI wrapper: prints a human-readable list."""
+    convos = list_conversations_data(email)
     if not convos:
         print("No conversations.")
         return
@@ -252,7 +276,7 @@ def send_message(sender_email: str, conversation_id: str, text: str, disappearin
     convo = api_get(f"/conversations/{conversation_id}")
     participants = convo["participants"]
     if sender_email not in participants:
-        raise SystemExit(f"{sender_email} is not a participant in {conversation_id}")
+        raise CipherClientError(f"{sender_email} is not a participant in {conversation_id}")
 
     # 1. Fresh random content key + encrypt the actual message with it.
     cek = os.urandom(32)
@@ -317,36 +341,54 @@ def _iso_in(seconds: int) -> str:
 # Reading / decrypting
 # --------------------------------------------------------------------------
 
-def read_conversation(reader_email: str, conversation_id: str) -> None:
+def read_conversation_data(reader_email: str, conversation_id: str) -> list[dict]:
+    """Data-returning version: decrypts every message and returns a list
+    of {id, sender_email, created_date, plaintext} dicts (plaintext is
+    None with an `error` key set if decryption/addressing failed), for
+    programmatic use (e.g. the GUI)."""
     reader_private = load_private_key(reader_email)
-
     messages = api_get("/messages", params={"conversation_id": conversation_id})
-    if not messages:
-        print("No messages.")
-        return
 
     pubkey_cache: dict[str, ec.EllipticCurvePublicKey] = {}
+    results = []
 
     for m in messages:
         sender_email = m.get("sender_email", "unknown")
+        entry = {"id": m["id"], "sender_email": sender_email, "created_date": m.get("created_date", "")}
+
         sealed_entry = next((s for s in m["sealed_cek"] if s["recipient"] == reader_email), None)
         if sealed_entry is None:
-            print(f"[{m['id']}] {sender_email}: <not addressed to {reader_email}, skipping>")
+            entry["plaintext"] = None
+            entry["error"] = f"not addressed to {reader_email}"
+            results.append(entry)
             continue
-
-        if sender_email not in pubkey_cache:
-            pubkey_cache[sender_email] = fetch_public_key(sender_email)
-        wrap_key = derive_shared_key(reader_private, pubkey_cache[sender_email])
 
         try:
+            if sender_email not in pubkey_cache:
+                pubkey_cache[sender_email] = fetch_public_key(sender_email)
+            wrap_key = derive_shared_key(reader_private, pubkey_cache[sender_email])
             cek = aes_gcm_decrypt(wrap_key, sealed_entry["c"], sealed_entry["i"])
-            plaintext = aes_gcm_decrypt(cek, m["encrypted_content"], m["iv"]).decode("utf-8")
+            entry["plaintext"] = aes_gcm_decrypt(cek, m["encrypted_content"], m["iv"]).decode("utf-8")
         except Exception as e:  # noqa: BLE001 - surface decrypt failures plainly
-            print(f"[{m['id']}] {sender_email}: <decryption failed: {e}>")
-            continue
+            entry["plaintext"] = None
+            entry["error"] = f"decryption failed: {e}"
 
-        ts = m.get("created_date", "")
-        print(f"[{ts}] {sender_email}: {plaintext}")
+        results.append(entry)
+
+    return results
+
+
+def read_conversation(reader_email: str, conversation_id: str) -> None:
+    """CLI wrapper: prints a human-readable transcript."""
+    entries = read_conversation_data(reader_email, conversation_id)
+    if not entries:
+        print("No messages.")
+        return
+    for e in entries:
+        if e.get("error"):
+            print(f"[{e['id']}] {e['sender_email']}: <{e['error']}>")
+        else:
+            print(f"[{e['created_date']}] {e['sender_email']}: {e['plaintext']}")
 
 
 # --------------------------------------------------------------------------
@@ -391,9 +433,11 @@ def main() -> None:
             send_message(args.email, args.conversation_id, args.text, args.disappear_after)
         elif args.command == "read":
             read_conversation(args.email, args.conversation_id)
-    except requests.HTTPError as e:
-        body = e.response.text if e.response is not None else ""
-        raise SystemExit(f"API error: {e}\n{body}")
+    except (requests.exceptions.ConnectionError, requests.HTTPError, CipherClientError) as e:
+        if isinstance(e, requests.HTTPError):
+            body = e.response.text if e.response is not None else ""
+            raise SystemExit(f"API error: {e}\n{body}")
+        raise SystemExit(str(e))
 
 
 if __name__ == "__main__":
