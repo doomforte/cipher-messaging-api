@@ -138,6 +138,13 @@ def _key_path(email: str) -> Path:
     return KEY_DIR / f"{safe}.private.pem"
 
 
+def has_local_identity(email: str) -> bool:
+    """Whether a local keypair already exists for this email — i.e. this
+    looks like a returning user on this device rather than a first-time
+    registration. Used by the GUI to greet returning users differently."""
+    return _key_path(email).exists()
+
+
 def generate_keypair() -> ec.EllipticCurvePrivateKey:
     return ec.generate_private_key(ec.SECP256R1())
 
