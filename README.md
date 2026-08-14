@@ -25,23 +25,47 @@ Render's free web services spin down after 15 minutes of inactivity and
 take ~30–60s to wake back up on the next request — fine for personal use,
 just expect a cold-start delay occasionally.
 
-## ⚠️ Persistence
+**Python version:** this repo pins Python to 3.11 (via `runtime.txt` and
+`render.yaml`'s `PYTHON_VERSION`). Don't remove that — newer Python
+versions (3.13+) don't yet have prebuilt wheels for some dependencies
+(e.g. `pydantic-core`), which makes Render try to compile them from
+source and fail, since its build environment can't write to the Rust
+build cache.
+
+## ⚠️ Persistence — set up Supabase
 
 Render's **free** web services have an *ephemeral* filesystem: the
 default `sqlite:///./data.db` gets wiped every time the service restarts
-or redeploys. That's fine for trying things out, but not for real use.
+or redeploys. To actually keep your data, point `DATABASE_URL` at a
+[Supabase](https://supabase.com) Postgres project (free tier, no card
+required for the first project):
 
-To persist data across restarts, point `DATABASE_URL` at a free hosted
-Postgres instance instead — e.g. [Neon](https://neon.tech) or
-[Supabase](https://supabase.com) both have free tiers. Once you have a
-connection string, set it as the `DATABASE_URL` env var on Render:
+1. Create a Supabase account and a new project. Pick any name/region;
+   set a database password when prompted (save it — you'll need it in
+   the connection string).
+2. In the project dashboard: **Settings → Database → Connection string**.
+   Choose the **Transaction pooler** connection string (port `6543`), not
+   the direct connection (port `5432`). The pooler is designed for
+   environments like Render that open lots of short-lived connections;
+   the direct connection has a low connection-count limit on the free
+   tier and will get exhausted quickly.
+3. Copy that URI and replace `[YOUR-PASSWORD]` with your actual database
+   password. It'll look like:
+   ```
+   postgresql://postgres.xxxxxxxxxxxx:[YOUR-PASSWORD]@aws-0-us-east-1.pooler.supabase.com:6543/postgres
+   ```
+4. In Render: your service → **Environment** tab → set `DATABASE_URL` to
+   that string → save (Render will redeploy automatically).
+5. Check the Logs tab for a clean startup with no database errors. The
+   server creates its tables automatically on first boot
+   (`Base.metadata.create_all`) — no migration step needed for this
+   project's scope.
 
-```
-DATABASE_URL=postgresql://user:password@host/dbname
-```
-
-The server auto-detects Postgres vs SQLite from the URL — no code
-changes needed.
+No code changes needed — the server auto-detects Postgres vs SQLite from
+the URL. You can confirm data is landing in Supabase from **Table
+Editor** in the Supabase dashboard: you should see `identities`,
+`conversations`, and `messages` tables appear after you register a user
+or send a message.
 
 ## Run locally
 
