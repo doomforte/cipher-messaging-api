@@ -20,10 +20,9 @@ API_KEY environment variable. Set this on Render (or generate one with
 
 Storage: SQLAlchemy against DATABASE_URL (defaults to a local SQLite
 file). Render's free web services have an EPHEMERAL filesystem — data
-in a local sqlite file will be wiped on every redeploy/restart. For
-anything you want to persist, point DATABASE_URL at a free hosted
-Postgres instance (e.g. Neon, Supabase, or Render's own Postgres) —
-see README.md.
+in a local sqlite file will be wiped on every redeploy/restart. Point
+DATABASE_URL at a Supabase Postgres project instead to persist data —
+see README.md for the connection string to use.
 
 Run locally:
     pip install -r requirements.txt
@@ -58,8 +57,22 @@ if not API_KEY:
         "on Render: set it in the service's Environment tab)."
     )
 
+# Some providers hand out `postgres://` (old Heroku-style); SQLAlchemy 1.4+
+# requires the `postgresql://` scheme. Supabase already gives you the
+# correct form, but normalize just in case a connection string gets
+# copied from somewhere else.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    # Hosted Postgres (Supabase included) can silently drop idle
+    # connections; pool_pre_ping tests each connection before use so a
+    # stale one gets transparently replaced instead of raising mid-request.
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
