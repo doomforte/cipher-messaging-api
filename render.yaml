@@ -11,4 +11,4 @@ services:
       - key: API_KEY
         generateValue: true
       - key: DATABASE_URL
-        value: sqlite:///./data.db
+        value: postgresql://postgres.gebanlqunirbitsbyypf:TFNAtGdWWDwKGB0S@aws-0-us-west-2.pooler.supabase.com:6543/postgres

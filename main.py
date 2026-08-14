@@ -127,6 +127,17 @@ class MessageRow(Base):
     updated_date = Column(String, default=now_iso)
 
 
+class ConversationMembershipRow(Base):
+    __tablename__ = "conversation_memberships"
+    id = Column(String, primary_key=True, default=new_id)
+    conversation_id = Column(String, index=True, nullable=False)
+    email = Column(String, index=True, nullable=False)
+    status = Column(String, nullable=False, default="pending")  # pending, accepted, declined
+    role = Column(String, nullable=False, default="member")  # creator, member
+    created_date = Column(String, default=now_iso)
+    updated_date = Column(String, default=now_iso)
+
+
 Base.metadata.create_all(engine)
 
 
@@ -173,6 +184,7 @@ class IdentityOut(BaseModel):
 
 class ConversationIn(BaseModel):
     participants: list[str]
+    creator_email: str  # the email creating the conversation
     name: Optional[str] = None
     disappearing_ms: Optional[int] = 0
 
@@ -226,9 +238,25 @@ class MessageOut(BaseModel):
     updated_date: str
 
 
+class MembershipIn(BaseModel):
+    status: str  # accepted, declined
+
+
+class MembershipOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    conversation_id: str
+    email: str
+    status: str
+    role: str
+    created_date: str
+    updated_date: str
+
+
 # --------------------------------------------------------------------------
 # App
 # --------------------------------------------------------------------------
+
 
 app = FastAPI(title="Cipher Messaging API", version="1.0.0")
 
@@ -274,13 +302,29 @@ def get_identity(email: str, db: Session = Depends(get_db)):
 
 @app.post("/conversations", response_model=ConversationOut, dependencies=[Depends(require_api_key)])
 def create_conversation(body: ConversationIn, db: Session = Depends(get_db)):
+    all_participants = sorted(set(body.participants))
     row = ConversationRow(
         id=new_id(),
         name=body.name,
-        participants=sorted(set(body.participants)),
+        participants=all_participants,
         disappearing_ms=str(body.disappearing_ms or 0),
     )
     db.add(row)
+    db.flush()  # Generate row.id before creating memberships
+    
+    # Create membership entries: creator is "accepted", others are "pending"
+    for email in all_participants:
+        role = "creator" if email == body.creator_email else "member"
+        status = "accepted" if email == body.creator_email else "pending"
+        membership = ConversationMembershipRow(
+            id=new_id(),
+            conversation_id=row.id,
+            email=email,
+            role=role,
+            status=status,
+        )
+        db.add(membership)
+    
     db.commit()
     db.refresh(row)
     return row
@@ -288,8 +332,23 @@ def create_conversation(body: ConversationIn, db: Session = Depends(get_db)):
 
 @app.get("/conversations", response_model=list[ConversationOut], dependencies=[Depends(require_api_key)])
 def list_conversations(participant: str = Query(...), db: Session = Depends(get_db)):
-    rows = db.query(ConversationRow).order_by(ConversationRow.updated_date.desc()).all()
-    return [r for r in rows if participant in (r.participants or [])]
+    # Only return conversations where the participant has accepted the invite
+    memberships = (
+        db.query(ConversationMembershipRow)
+        .filter(ConversationMembershipRow.email == participant)
+        .filter(ConversationMembershipRow.status == "accepted")
+        .all()
+    )
+    conversation_ids = [m.conversation_id for m in memberships]
+    if not conversation_ids:
+        return []
+    rows = (
+        db.query(ConversationRow)
+        .filter(ConversationRow.id.in_(conversation_ids))
+        .order_by(ConversationRow.updated_date.desc())
+        .all()
+    )
+    return rows
 
 
 @app.get("/conversations/{conversation_id}", response_model=ConversationOut, dependencies=[Depends(require_api_key)])
@@ -318,6 +377,38 @@ def update_conversation(conversation_id: str, body: ConversationUpdate, db: Sess
     return row
 
 
+# ---- Memberships / Invites --------------------------------------------------
+
+@app.get("/memberships/pending", response_model=list[MembershipOut], dependencies=[Depends(require_api_key)])
+def list_pending_memberships(email: str = Query(...), db: Session = Depends(get_db)):
+    """List all pending invites for a user."""
+    rows = (
+        db.query(ConversationMembershipRow)
+        .filter(ConversationMembershipRow.email == email)
+        .filter(ConversationMembershipRow.status == "pending")
+        .order_by(ConversationMembershipRow.created_date.desc())
+        .all()
+    )
+    return rows
+
+
+@app.put("/memberships/{membership_id}", response_model=MembershipOut, dependencies=[Depends(require_api_key)])
+def respond_to_invite(membership_id: str, body: MembershipIn, db: Session = Depends(get_db)):
+    """Accept or decline a conversation invite."""
+    if body.status not in ["accepted", "declined"]:
+        raise HTTPException(status_code=400, detail="status must be 'accepted' or 'declined'")
+    
+    membership = db.query(ConversationMembershipRow).filter(ConversationMembershipRow.id == membership_id).first()
+    if not membership:
+        raise HTTPException(status_code=404, detail="membership not found")
+    
+    membership.status = body.status
+    membership.updated_date = now_iso()
+    db.commit()
+    db.refresh(membership)
+    return membership
+
+
 # ---- Messages --------------------------------------------------------------
 
 @app.post("/messages", response_model=MessageOut, dependencies=[Depends(require_api_key)])
@@ -325,8 +416,16 @@ def create_message(body: MessageIn, db: Session = Depends(get_db)):
     convo = db.query(ConversationRow).filter(ConversationRow.id == body.conversation_id).first()
     if not convo:
         raise HTTPException(status_code=404, detail="conversation not found")
-    if body.sender_email not in (convo.participants or []):
-        raise HTTPException(status_code=403, detail="sender is not a participant in this conversation")
+    
+    # Check that sender is an accepted member of the conversation
+    membership = (
+        db.query(ConversationMembershipRow)
+        .filter(ConversationMembershipRow.conversation_id == body.conversation_id)
+        .filter(ConversationMembershipRow.email == body.sender_email)
+        .first()
+    )
+    if not membership or membership.status != "accepted":
+        raise HTTPException(status_code=403, detail="sender is not an accepted member of this conversation")
 
     row = MessageRow(
         id=new_id(),

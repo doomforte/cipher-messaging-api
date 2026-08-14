@@ -248,11 +248,15 @@ def register(email: str) -> None:
 
 def create_conversation(creator_email: str, participants: list[str], name: str | None) -> str:
     all_participants = sorted(set(participants + [creator_email]))
-    payload = {"participants": all_participants}
+    payload = {
+        "participants": all_participants,
+        "creator_email": creator_email,
+    }
     if name:
         payload["name"] = name
     result = api_post("/conversations", payload)
     print(f"Created conversation {result['id']} with {all_participants}")
+    print(f"Invitations sent to: {', '.join([p for p in all_participants if p != creator_email])}")
     return result["id"]
 
 
@@ -271,6 +275,35 @@ def list_conversations(email: str) -> None:
         preview = c.get("last_message_preview")
         note = "(has messages)" if preview else "(empty)"
         print(f"- {c['id']}  name={c.get('name') or '(unnamed)'}  {note}  participants={c['participants']}")
+
+
+# --------------------------------------------------------------------------
+# Invites
+# --------------------------------------------------------------------------
+
+def get_pending_invites(email: str) -> list[dict]:
+    """Fetch all pending conversation invites for a user."""
+    return api_get("/memberships/pending", params={"email": email})
+
+
+def list_pending_invites(email: str) -> None:
+    """CLI wrapper: prints pending invites."""
+    invites = get_pending_invites(email)
+    if not invites:
+        print("No pending invites.")
+        return
+    for invite in invites:
+        convo_id = invite["conversation_id"]
+        membership_id = invite["id"]
+        print(f"- Invite {membership_id} for conversation {convo_id}")
+
+
+def respond_to_invite(membership_id: str, accept: bool) -> None:
+    """Accept or decline a conversation invite."""
+    status = "accepted" if accept else "declined"
+    api_put(f"/memberships/{membership_id}", {"status": status})
+    action = "accepted" if accept else "declined"
+    print(f"Invite {action}: {membership_id}")
 
 
 # --------------------------------------------------------------------------
@@ -427,6 +460,15 @@ def main() -> None:
     p.add_argument("email")
     p.add_argument("conversation_id")
 
+    p = sub.add_parser("list-invites", help="List pending conversation invites.")
+    p.add_argument("email", help="Your email")
+
+    p = sub.add_parser("accept-invite", help="Accept a conversation invite.")
+    p.add_argument("membership_id", help="The invite membership ID")
+
+    p = sub.add_parser("decline-invite", help="Decline a conversation invite.")
+    p.add_argument("membership_id", help="The invite membership ID")
+
     args = parser.parse_args()
 
     try:
@@ -440,6 +482,12 @@ def main() -> None:
             send_message(args.email, args.conversation_id, args.text, args.disappear_after)
         elif args.command == "read":
             read_conversation(args.email, args.conversation_id)
+        elif args.command == "list-invites":
+            list_pending_invites(args.email)
+        elif args.command == "accept-invite":
+            respond_to_invite(args.membership_id, accept=True)
+        elif args.command == "decline-invite":
+            respond_to_invite(args.membership_id, accept=False)
     except (requests.exceptions.ConnectionError, requests.HTTPError, CipherClientError) as e:
         if isinstance(e, requests.HTTPError):
             body = e.response.text if e.response is not None else ""

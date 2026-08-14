@@ -48,6 +48,9 @@ C_ACCENT = "#5b5fef"
 C_ACCENT_HOVER = "#4a4ed9"
 C_ACCENT_TEXT = "#ffffff"
 
+C_SUCCESS = "#10b981"
+C_SUCCESS_HOVER = "#059669"
+
 C_BUBBLE_ME_BG = "#5b5fef"
 C_BUBBLE_ME_TEXT = "#ffffff"
 C_BUBBLE_OTHER_BG = "#ffffff"
@@ -208,6 +211,7 @@ class CipherApp(tk.Tk):
 
         self.email: str | None = None
         self.conversations: list[dict] = []
+        self.pending_invites: list[dict] = []
         self.selected_conversation_id: str | None = None
         self._refresh_job = None
         self._task_queue: queue.Queue = queue.Queue()
@@ -431,6 +435,14 @@ class CipherApp(tk.Tk):
         new_convo_btn = RoundedButton(actions, "+  New conversation", self._open_new_conversation_dialog, bg=C_ACCENT, hover_bg=C_ACCENT_HOVER)
         new_convo_btn.pack(fill="x")
 
+        # Invites section
+        invites_label = tk.Frame(sidebar, bg=C_SIDEBAR, padx=18)
+        invites_label.pack(fill="x")
+        tk.Label(invites_label, text="PENDING INVITES", font=font(8, "bold"), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT).pack(anchor="w", pady=(4, 6))
+
+        self.invites_scroll = ScrollableFrame(sidebar, bg=C_SIDEBAR)
+        self.invites_scroll.pack(fill="x", padx=8, pady=(0, 8), max_height=100)
+
         list_label = tk.Frame(sidebar, bg=C_SIDEBAR, padx=18)
         list_label.pack(fill="x")
         tk.Label(list_label, text="CONVERSATIONS", font=font(8, "bold"), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT).pack(anchor="w", pady=(4, 6))
@@ -469,6 +481,7 @@ class CipherApp(tk.Tk):
 
     def _schedule_refresh(self):
         self._refresh_conversations()
+        self._refresh_pending_invites()
         if self.selected_conversation_id:
             self._refresh_messages(self.selected_conversation_id, preserve_scroll=True)
         self._refresh_job = self.after(REFRESH_MS, self._schedule_refresh)
@@ -478,6 +491,71 @@ class CipherApp(tk.Tk):
         tk.Label(
             self.messages_scroll.inner, text=text, font=font(10), bg=C_MAIN_BG, fg=C_TEXT_MUTED,
         ).pack(pady=40)
+
+    # ---- invites ----
+
+    def _refresh_pending_invites(self):
+        def work():
+            return cc.get_pending_invites(self.email)
+
+        def on_ok(invites):
+            self.pending_invites = invites or []
+            self.invites_scroll.clear()
+            if not self.pending_invites:
+                tk.Label(
+                    self.invites_scroll.inner, text="No pending invites.", font=font(9), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT,
+                    wraplength=220, justify="left",
+                ).pack(anchor="w", padx=10, pady=10)
+            for invite in self.pending_invites:
+                self._add_invite_row(invite)
+
+        def on_err(err):
+            self._show_error("Couldn't load invites", err)
+
+        self.run_async(work, on_ok, on_err)
+
+    def _add_invite_row(self, invite: dict):
+        row = tk.Frame(self.invites_scroll.inner, bg="#2a3547", padx=10, pady=8)
+        row.pack(fill="x", pady=1)
+
+        # Display conversation ID and role
+        convo_id = invite["conversation_id"][:8] + "..."
+        tk.Label(row, text=f"Invite to {convo_id}", font=font(9), bg="#2a3547", fg=C_SIDEBAR_TEXT, anchor="w").pack(fill="x", pady=(0, 6))
+
+        # Accept/Decline buttons
+        button_frame = tk.Frame(row, bg="#2a3547")
+        button_frame.pack(fill="x")
+
+        def accept():
+            def work():
+                cc.respond_to_invite(invite["id"], accept=True)
+
+            def on_ok(_):
+                self._refresh_pending_invites()
+                self._refresh_conversations()
+
+            def on_err(err):
+                self._show_error("Couldn't accept invite", err)
+
+            self.run_async(work, on_ok, on_err)
+
+        def decline():
+            def work():
+                cc.respond_to_invite(invite["id"], accept=False)
+
+            def on_ok(_):
+                self._refresh_pending_invites()
+
+            def on_err(err):
+                self._show_error("Couldn't decline invite", err)
+
+            self.run_async(work, on_ok, on_err)
+
+        accept_btn = RoundedButton(button_frame, "Accept", accept, bg=C_SUCCESS, hover_bg=C_SUCCESS_HOVER, pad=(10, 6))
+        accept_btn.pack(side="left", padx=(0, 4))
+
+        decline_btn = RoundedButton(button_frame, "Decline", decline, bg="#6b7280", hover_bg="#4b5563", pad=(10, 6))
+        decline_btn.pack(side="left")
 
     # ---- conversations ----
 
