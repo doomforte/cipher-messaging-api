@@ -9,14 +9,25 @@ crypto happens on the client (see cipher_client.py).
 Entities
 --------
 Identity      — email -> public key directory
-Conversation  — a set of participant emails (+ encrypted preview of the
-                 last message, for inbox-style UIs)
+Conversation  — a set of participant emails, each with an invitation
+                 status ("pending" until they accept/decline), + an
+                 encrypted preview of the last message for inbox UIs
 Message       — one encrypted message, with a per-recipient sealed
                  content key (sealed_cek)
 
-Auth: every request must send a header `x-api-key` matching the
-API_KEY environment variable. Set this on Render (or generate one with
-`openssl rand -hex 32`) — do NOT hardcode a real key into this file.
+Auth: every request (except the health check) must send
+`Authorization: Bearer <supabase access token>`. Tokens are issued by
+Supabase Auth (the client signs up / logs in directly against Supabase)
+and verified here using SUPABASE_JWT_SECRET — found in your Supabase
+project under Settings -> API -> JWT Settings -> JWT Secret. This is a
+SERVER-ONLY secret: never put it in a distributed client app. (The
+Supabase URL and anon/public key the client uses to talk to Supabase
+Auth are, by contrast, meant to be public — see README.md.)
+
+Invitations: when a conversation is created, every participant besides
+the creator starts out "pending". They can't send or read messages in
+that conversation until they call POST /conversations/{id}/respond
+with {"status": "accepted"} (or "declined", which removes their access).
 
 Storage: SQLAlchemy against DATABASE_URL (defaults to a local SQLite
 file). Render's free web services have an EPHEMERAL filesystem — data
@@ -26,35 +37,36 @@ see README.md for the connection string to use.
 
 Run locally:
     pip install -r requirements.txt
-    API_KEY=dev-secret uvicorn main:app --reload
+    export SUPABASE_JWT_SECRET=...   # from your Supabase project
+    uvicorn main:app --reload
 """
 
-import json
 import os
-import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import JSON, Column, DateTime, String, create_engine
+from sqlalchemy import JSON, Column, String, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
 
-API_KEY = os.environ.get("API_KEY")
+SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./data.db")
 
-if not API_KEY:
-    # Fail loudly rather than silently running with no auth.
+if not SUPABASE_JWT_SECRET:
     raise RuntimeError(
-        "API_KEY environment variable is not set. Set it before starting "
-        "the server (locally: `export API_KEY=$(openssl rand -hex 32)`; "
-        "on Render: set it in the service's Environment tab)."
+        "SUPABASE_JWT_SECRET environment variable is not set. Find it in "
+        "your Supabase project: Settings -> API -> JWT Settings -> JWT "
+        "Secret, then set it on Render's Environment tab. This is separate "
+        "from the Supabase URL/anon key baked into the client app."
     )
 
 # Some providers hand out `postgres://` (old Heroku-style); SQLAlchemy 1.4+
@@ -103,6 +115,8 @@ class ConversationRow(Base):
     id = Column(String, primary_key=True, default=new_id)
     name = Column(String, nullable=True)
     participants = Column(JSON, nullable=False)  # list[str]
+    creator_email = Column(String, nullable=False)
+    participant_status = Column(JSON, nullable=False, default=dict)  # {email: "pending"|"accepted"|"declined"}
     last_message_at = Column(String, nullable=True)
     last_message_preview = Column(String, nullable=True)
     last_message_preview_iv = Column(String, nullable=True)
@@ -127,17 +141,6 @@ class MessageRow(Base):
     updated_date = Column(String, default=now_iso)
 
 
-class ConversationMembershipRow(Base):
-    __tablename__ = "conversation_memberships"
-    id = Column(String, primary_key=True, default=new_id)
-    conversation_id = Column(String, index=True, nullable=False)
-    email = Column(String, index=True, nullable=False)
-    status = Column(String, nullable=False, default="pending")  # pending, accepted, declined
-    role = Column(String, nullable=False, default="member")  # creator, member
-    created_date = Column(String, default=now_iso)
-    updated_date = Column(String, default=now_iso)
-
-
 Base.metadata.create_all(engine)
 
 
@@ -150,12 +153,24 @@ def get_db():
 
 
 # --------------------------------------------------------------------------
-# Auth
+# Auth — verify a Supabase-issued JWT and extract the caller's email.
 # --------------------------------------------------------------------------
 
-def require_api_key(x_api_key: Optional[str] = Header(default=None)):
-    if not x_api_key or x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="missing or invalid x-api-key header")
+bearer_scheme = HTTPBearer(auto_error=True)
+
+
+def require_auth(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -> str:
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(
+            token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated"
+        )
+    except jwt.PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"invalid or expired session: {e}")
+    email = payload.get("email")
+    if not email:
+        raise HTTPException(status_code=401, detail="token is missing an email claim")
+    return email
 
 
 # --------------------------------------------------------------------------
@@ -183,10 +198,13 @@ class IdentityOut(BaseModel):
 
 
 class ConversationIn(BaseModel):
-    participants: list[str]
-    creator_email: str  # the email creating the conversation
+    participants: list[str]  # other participants; creator is added automatically
     name: Optional[str] = None
     disappearing_ms: Optional[int] = 0
+
+
+class ConversationRespond(BaseModel):
+    status: str  # "accepted" or "declined"
 
 
 class ConversationUpdate(BaseModel):
@@ -204,6 +222,8 @@ class ConversationOut(BaseModel):
     id: str
     name: Optional[str]
     participants: list[str]
+    creator_email: str
+    participant_status: dict
     last_message_at: Optional[str]
     last_message_preview: Optional[str]
     last_message_preview_iv: Optional[str]
@@ -238,27 +258,11 @@ class MessageOut(BaseModel):
     updated_date: str
 
 
-class MembershipIn(BaseModel):
-    status: str  # accepted, declined
-
-
-class MembershipOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-    id: str
-    conversation_id: str
-    email: str
-    status: str
-    role: str
-    created_date: str
-    updated_date: str
-
-
 # --------------------------------------------------------------------------
 # App
 # --------------------------------------------------------------------------
 
-
-app = FastAPI(title="Cipher Messaging API", version="1.0.0")
+app = FastAPI(title="Cipher Messaging API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -268,16 +272,27 @@ app.add_middleware(
 )
 
 
+def _status_of(convo: ConversationRow, email: str) -> str:
+    if email == convo.creator_email:
+        return "accepted"
+    return (convo.participant_status or {}).get(email, "pending")
+
+
 @app.get("/")
 def health():
-    """Health check — also what Render pings to confirm the service is up."""
+    """Health check — also what Render pings to confirm the service is up.
+    Deliberately not behind auth, since the client checks this before
+    a user has signed in."""
     return {"status": "ok", "time": now_iso()}
 
 
 # ---- Identities ----------------------------------------------------------
 
-@app.post("/identities", response_model=IdentityOut, dependencies=[Depends(require_api_key)])
-def upsert_identity(body: IdentityIn, db: Session = Depends(get_db)):
+@app.post("/identities", response_model=IdentityOut)
+def upsert_identity(body: IdentityIn, current_email: str = Depends(require_auth), db: Session = Depends(get_db)):
+    if body.email != current_email:
+        raise HTTPException(status_code=403, detail="can only publish an identity for your own authenticated email")
+
     row = db.query(IdentityRow).filter(IdentityRow.email == body.email).first()
     if row:
         row.public_key = body.public_key
@@ -290,8 +305,8 @@ def upsert_identity(body: IdentityIn, db: Session = Depends(get_db)):
     return row
 
 
-@app.get("/identities/{email}", response_model=IdentityOut, dependencies=[Depends(require_api_key)])
-def get_identity(email: str, db: Session = Depends(get_db)):
+@app.get("/identities/{email}", response_model=IdentityOut)
+def get_identity(email: str, current_email: str = Depends(require_auth), db: Session = Depends(get_db)):
     row = db.query(IdentityRow).filter(IdentityRow.email == email).first()
     if not row:
         raise HTTPException(status_code=404, detail=f"no identity for {email}")
@@ -300,71 +315,83 @@ def get_identity(email: str, db: Session = Depends(get_db)):
 
 # ---- Conversations ---------------------------------------------------------
 
-@app.post("/conversations", response_model=ConversationOut, dependencies=[Depends(require_api_key)])
-def create_conversation(body: ConversationIn, db: Session = Depends(get_db)):
-    all_participants = sorted(set(body.participants))
+@app.post("/conversations", response_model=ConversationOut)
+def create_conversation(body: ConversationIn, current_email: str = Depends(require_auth), db: Session = Depends(get_db)):
+    participants = sorted(set(body.participants) | {current_email})
+    statuses = {email: ("accepted" if email == current_email else "pending") for email in participants}
     row = ConversationRow(
         id=new_id(),
         name=body.name,
-        participants=all_participants,
+        participants=participants,
+        creator_email=current_email,
+        participant_status=statuses,
         disappearing_ms=str(body.disappearing_ms or 0),
     )
     db.add(row)
-    db.flush()  # Generate row.id before creating memberships
-    
-    # Create membership entries: creator is "accepted", others are "pending"
-    for email in all_participants:
-        role = "creator" if email == body.creator_email else "member"
-        status = "accepted" if email == body.creator_email else "pending"
-        membership = ConversationMembershipRow(
-            id=new_id(),
-            conversation_id=row.id,
-            email=email,
-            role=role,
-            status=status,
-        )
-        db.add(membership)
-    
     db.commit()
     db.refresh(row)
     return row
 
 
-@app.get("/conversations", response_model=list[ConversationOut], dependencies=[Depends(require_api_key)])
-def list_conversations(participant: str = Query(...), db: Session = Depends(get_db)):
-    # Only return conversations where the participant has accepted the invite
-    memberships = (
-        db.query(ConversationMembershipRow)
-        .filter(ConversationMembershipRow.email == participant)
-        .filter(ConversationMembershipRow.status == "accepted")
-        .all()
-    )
-    conversation_ids = [m.conversation_id for m in memberships]
-    if not conversation_ids:
-        return []
-    rows = (
-        db.query(ConversationRow)
-        .filter(ConversationRow.id.in_(conversation_ids))
-        .order_by(ConversationRow.updated_date.desc())
-        .all()
-    )
-    return rows
+@app.get("/conversations", response_model=list[ConversationOut])
+def list_conversations(current_email: str = Depends(require_auth), db: Session = Depends(get_db)):
+    rows = db.query(ConversationRow).order_by(ConversationRow.updated_date.desc()).all()
+    return [r for r in rows if current_email in (r.participants or [])]
 
 
-@app.get("/conversations/{conversation_id}", response_model=ConversationOut, dependencies=[Depends(require_api_key)])
-def get_conversation(conversation_id: str, db: Session = Depends(get_db)):
+@app.get("/conversations/{conversation_id}", response_model=ConversationOut)
+def get_conversation(conversation_id: str, current_email: str = Depends(require_auth), db: Session = Depends(get_db)):
     row = db.query(ConversationRow).filter(ConversationRow.id == conversation_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="conversation not found")
+    if current_email not in (row.participants or []):
+        raise HTTPException(status_code=403, detail="not a participant in this conversation")
     return row
 
 
-@app.put("/conversations/{conversation_id}", response_model=ConversationOut, dependencies=[Depends(require_api_key)])
-def update_conversation(conversation_id: str, body: ConversationUpdate, db: Session = Depends(get_db)):
+@app.post("/conversations/{conversation_id}/respond", response_model=ConversationOut)
+def respond_to_conversation(
+    conversation_id: str,
+    body: ConversationRespond,
+    current_email: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
     row = db.query(ConversationRow).filter(ConversationRow.id == conversation_id).first()
     if not row:
         raise HTTPException(status_code=404, detail="conversation not found")
+    if current_email not in (row.participants or []):
+        raise HTTPException(status_code=403, detail="not a participant in this conversation")
+    if current_email == row.creator_email:
+        raise HTTPException(status_code=400, detail="the creator is automatically an accepted participant")
+    if body.status not in ("accepted", "declined"):
+        raise HTTPException(status_code=400, detail="status must be 'accepted' or 'declined'")
+
+    statuses = dict(row.participant_status or {})
+    statuses[current_email] = body.status
+    row.participant_status = statuses
+    row.updated_date = now_iso()
+    db.commit()
+    db.refresh(row)
+    return row
+
+
+@app.put("/conversations/{conversation_id}", response_model=ConversationOut)
+def update_conversation(
+    conversation_id: str,
+    body: ConversationUpdate,
+    current_email: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    row = db.query(ConversationRow).filter(ConversationRow.id == conversation_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if _status_of(row, current_email) != "accepted":
+        raise HTTPException(status_code=403, detail="must be an accepted participant to update this conversation")
+
     data = body.model_dump(exclude_unset=True)
+    if data.get("last_message_sender") not in (None, current_email):
+        raise HTTPException(status_code=403, detail="last_message_sender must be yourself")
+
     for field, value in data.items():
         if field == "last_message_sealed_cek" and value is not None:
             value = [v if isinstance(v, dict) else v.model_dump() for v in value]
@@ -377,55 +404,21 @@ def update_conversation(conversation_id: str, body: ConversationUpdate, db: Sess
     return row
 
 
-# ---- Memberships / Invites --------------------------------------------------
-
-@app.get("/memberships/pending", response_model=list[MembershipOut], dependencies=[Depends(require_api_key)])
-def list_pending_memberships(email: str = Query(...), db: Session = Depends(get_db)):
-    """List all pending invites for a user."""
-    rows = (
-        db.query(ConversationMembershipRow)
-        .filter(ConversationMembershipRow.email == email)
-        .filter(ConversationMembershipRow.status == "pending")
-        .order_by(ConversationMembershipRow.created_date.desc())
-        .all()
-    )
-    return rows
-
-
-@app.put("/memberships/{membership_id}", response_model=MembershipOut, dependencies=[Depends(require_api_key)])
-def respond_to_invite(membership_id: str, body: MembershipIn, db: Session = Depends(get_db)):
-    """Accept or decline a conversation invite."""
-    if body.status not in ["accepted", "declined"]:
-        raise HTTPException(status_code=400, detail="status must be 'accepted' or 'declined'")
-    
-    membership = db.query(ConversationMembershipRow).filter(ConversationMembershipRow.id == membership_id).first()
-    if not membership:
-        raise HTTPException(status_code=404, detail="membership not found")
-    
-    membership.status = body.status
-    membership.updated_date = now_iso()
-    db.commit()
-    db.refresh(membership)
-    return membership
-
-
 # ---- Messages --------------------------------------------------------------
 
-@app.post("/messages", response_model=MessageOut, dependencies=[Depends(require_api_key)])
-def create_message(body: MessageIn, db: Session = Depends(get_db)):
+@app.post("/messages", response_model=MessageOut)
+def create_message(body: MessageIn, current_email: str = Depends(require_auth), db: Session = Depends(get_db)):
+    if body.sender_email != current_email:
+        raise HTTPException(status_code=403, detail="sender_email must match the authenticated user")
+
     convo = db.query(ConversationRow).filter(ConversationRow.id == body.conversation_id).first()
     if not convo:
         raise HTTPException(status_code=404, detail="conversation not found")
-    
-    # Check that sender is an accepted member of the conversation
-    membership = (
-        db.query(ConversationMembershipRow)
-        .filter(ConversationMembershipRow.conversation_id == body.conversation_id)
-        .filter(ConversationMembershipRow.email == body.sender_email)
-        .first()
-    )
-    if not membership or membership.status != "accepted":
-        raise HTTPException(status_code=403, detail="sender is not an accepted member of this conversation")
+    if _status_of(convo, current_email) != "accepted":
+        raise HTTPException(
+            status_code=403,
+            detail="you must accept this conversation's invitation before sending messages",
+        )
 
     row = MessageRow(
         id=new_id(),
@@ -443,8 +436,21 @@ def create_message(body: MessageIn, db: Session = Depends(get_db)):
     return row
 
 
-@app.get("/messages", response_model=list[MessageOut], dependencies=[Depends(require_api_key)])
-def list_messages(conversation_id: str = Query(...), db: Session = Depends(get_db)):
+@app.get("/messages", response_model=list[MessageOut])
+def list_messages(
+    conversation_id: str = Query(...),
+    current_email: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    convo = db.query(ConversationRow).filter(ConversationRow.id == conversation_id).first()
+    if not convo:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if _status_of(convo, current_email) != "accepted":
+        raise HTTPException(
+            status_code=403,
+            detail="you must accept this conversation's invitation before viewing messages",
+        )
+
     rows = (
         db.query(MessageRow)
         .filter(MessageRow.conversation_id == conversation_id)
