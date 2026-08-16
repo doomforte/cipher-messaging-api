@@ -8,7 +8,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      - key: API_KEY
-        generateValue: true
+      - key: SUPABASE_JWT_SECRET
+        sync: false
       - key: DATABASE_URL
-        value: postgresql://postgres.gebanlqunirbitsbyypf:TFNAtGdWWDwKGB0S@aws-0-us-west-2.pooler.supabase.com:6543/postgres
+        sync: false
