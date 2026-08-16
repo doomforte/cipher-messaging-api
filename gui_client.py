@@ -7,11 +7,11 @@ window instead of a command line).
 Run:
     python3 gui_client.py
 
-On first launch it asks for your server URL + API key (or reads them
-from CIPHER_API_URL / CIPHER_API_KEY env vars if set), then lets you
-register a new identity or continue as a returning one. Network calls
-run on a background thread so the window never freezes; all
-encryption/decryption happens locally, same as the CLI.
+On first launch it connects using the baked-in server/Supabase config
+below, then shows a sign-up/log-in screen (real per-user accounts via
+Supabase Auth — no shared API key). Network calls run on a background
+thread so the window never freezes; all encryption/decryption happens
+locally, same as the CLI.
 """
 
 import queue
@@ -26,6 +26,27 @@ import cipher_client as cc
 
 REFRESH_MS = 5000  # how often to poll for new conversations/messages
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# ---------------------------------------------------------------------------
+# Ship-time configuration
+#
+# Fill these in before distributing the app so end users never see a config
+# screen at all — the app just connects on launch and takes them straight to
+# sign up / log in.
+#
+# All three of these are safe to bake into a distributed app — none of them
+# are secrets. CIPHER_API_URL is just your server's address. SUPABASE_URL
+# and the anon/public key are meant to be embedded in client apps by
+# Supabase's own design: they identify your Supabase *project*, not a user,
+# and don't grant access to anything by themselves. Real access control
+# happens server-side, via SUPABASE_JWT_SECRET (which stays on your Render
+# server and is never shipped here) verifying each user's login session.
+#
+# Leave any of these blank to keep a manual "enter connection details"
+# screen on launch (handy while you're still developing/testing).
+DEFAULT_CIPHER_API_URL = ""    # e.g. "https://your-service.onrender.com"
+DEFAULT_SUPABASE_URL = ""      # e.g. "https://xxxxxxxx.supabase.co"
+DEFAULT_SUPABASE_ANON_KEY = ""  # Settings -> API -> Project API keys -> anon/public
 
 # ---------------------------------------------------------------------------
 # Palette / type scale — kept in one place so the look stays consistent.
@@ -48,9 +69,6 @@ C_ACCENT = "#5b5fef"
 C_ACCENT_HOVER = "#4a4ed9"
 C_ACCENT_TEXT = "#ffffff"
 
-C_SUCCESS = "#10b981"
-C_SUCCESS_HOVER = "#059669"
-
 C_BUBBLE_ME_BG = "#5b5fef"
 C_BUBBLE_ME_TEXT = "#ffffff"
 C_BUBBLE_OTHER_BG = "#ffffff"
@@ -59,6 +77,10 @@ C_BUBBLE_OTHER_TEXT = "#1e2330"
 
 C_ERROR = "#dc2626"
 C_SUCCESS = "#16a34a"
+C_SUCCESS_HOVER = "#128a3e"
+C_WARNING = "#d97706"
+C_DECLINE = "#9ca3af"
+C_DECLINE_HOVER = "#6b7280"
 
 F_FAMILY = "Segoe UI"  # Tk falls back gracefully if unavailable on this OS
 
@@ -211,13 +233,20 @@ class CipherApp(tk.Tk):
 
         self.email: str | None = None
         self.conversations: list[dict] = []
-        self.pending_invites: list[dict] = []
         self.selected_conversation_id: str | None = None
         self._refresh_job = None
         self._task_queue: queue.Queue = queue.Queue()
         self.after(80, self._poll_task_queue)
 
-        self._build_connect_screen()
+        if DEFAULT_CIPHER_API_URL and DEFAULT_SUPABASE_URL and DEFAULT_SUPABASE_ANON_KEY:
+            cc.configure(
+                base_url=DEFAULT_CIPHER_API_URL,
+                supabase_url=DEFAULT_SUPABASE_URL,
+                supabase_anon_key=DEFAULT_SUPABASE_ANON_KEY,
+            )
+            self._build_auth_screen()
+        else:
+            self._build_dev_config_screen()
 
     # ----------------------------------------------------------------
     # Background work helper — Tkinter isn't thread-safe, so worker
@@ -253,48 +282,46 @@ class CipherApp(tk.Tk):
             w.destroy()
 
     # ----------------------------------------------------------------
-    # Screen 1: connect to server
+    # Dev-only screen: enter connection details manually. Only shown
+    # when the DEFAULT_* constants above are blank — a shipped app
+    # skips straight to the auth screen. None of these three fields are
+    # secrets (see the comment at the top of this file).
     # ----------------------------------------------------------------
 
-    def _build_connect_screen(self):
+    def _build_dev_config_screen(self):
         self._clear()
         self.configure(bg=C_MAIN_BG)
 
         card = tk.Frame(self, bg="#ffffff", padx=48, pady=40, highlightbackground="#e5e7eb", highlightthickness=1)
         card.place(relx=0.5, rely=0.5, anchor="center")
 
-        tk.Label(card, text="Cipher Messaging", font=font(20, "bold"), bg="#ffffff", fg=C_TEXT_DARK).pack(anchor="w")
-        tk.Label(card, text="Connect to your server to get started.", font=font(10), bg="#ffffff", fg=C_TEXT_MUTED).pack(
-            anchor="w", pady=(2, 24)
-        )
+        tk.Label(card, text="Cipher Messaging (dev setup)", font=font(16, "bold"), bg="#ffffff", fg=C_TEXT_DARK).pack(anchor="w")
+        tk.Label(
+            card, text="Fill in DEFAULT_* constants at the top of gui_client.py\nto skip this screen for real users.",
+            font=font(9), bg="#ffffff", fg=C_TEXT_MUTED, justify="left",
+        ).pack(anchor="w", pady=(2, 20))
 
-        tk.Label(card, text="SERVER URL", font=font(8, "bold"), bg="#ffffff", fg=C_TEXT_MUTED).pack(anchor="w")
-        url_entry = PlaceholderEntry(card, placeholder="https://your-service.onrender.com", width=42)
-        if cc.BASE_URL and cc.BASE_URL != "http://127.0.0.1:8000":
-            url_entry.delete(0, tk.END)
-            url_entry.insert(0, cc.BASE_URL)
-            url_entry.config(fg=C_TEXT_DARK)
-            url_entry._placeholder_active = False
-        url_entry.pack(anchor="w", ipady=6, pady=(4, 16), fill="x")
+        def field(label, placeholder, show=None):
+            tk.Label(card, text=label, font=font(8, "bold"), bg="#ffffff", fg=C_TEXT_MUTED).pack(anchor="w")
+            entry = PlaceholderEntry(card, placeholder=placeholder, show=show, width=44)
+            entry.pack(anchor="w", ipady=6, pady=(4, 14), fill="x")
+            return entry
 
-        tk.Label(card, text="API KEY", font=font(8, "bold"), bg="#ffffff", fg=C_TEXT_MUTED).pack(anchor="w")
-        key_entry = PlaceholderEntry(card, placeholder="the API_KEY you set on the server", show="*", width=42)
-        if cc.API_KEY:
-            key_entry.delete(0, tk.END)
-            key_entry.insert(0, cc.API_KEY)
-            key_entry.config(fg=C_TEXT_DARK, show="*")
-            key_entry._placeholder_active = False
-        key_entry.pack(anchor="w", ipady=6, pady=(4, 8), fill="x")
+        url_entry = field("BACKEND URL", "https://your-service.onrender.com")
+        supabase_url_entry = field("SUPABASE URL", "https://xxxxxxxx.supabase.co")
+        supabase_key_entry = field("SUPABASE ANON KEY", "eyJhbGciOi...")
 
-        status_label = tk.Label(card, text="", font=font(9), bg="#ffffff", fg=C_ERROR, wraplength=340, justify="left")
-        status_label.pack(anchor="w", pady=(4, 16))
+        status_label = tk.Label(card, text="", font=font(9), bg="#ffffff", fg=C_ERROR, wraplength=360, justify="left")
+        status_label.pack(anchor="w", pady=(0, 12))
 
         def do_connect():
-            url, key = url_entry.value(), key_entry.value()
-            if not url or not key:
-                status_label.config(text="Both fields are required.", fg=C_ERROR)
+            url = url_entry.value()
+            supabase_url = supabase_url_entry.value()
+            supabase_key = supabase_key_entry.value()
+            if not url or not supabase_url or not supabase_key:
+                status_label.config(text="All three fields are required.", fg=C_ERROR)
                 return
-            cc.configure(base_url=url, api_key=key)
+            cc.configure(base_url=url, supabase_url=supabase_url, supabase_anon_key=supabase_key)
             status_label.config(text="Connecting…", fg=C_TEXT_MUTED)
             connect_btn.set_enabled(False)
 
@@ -302,7 +329,7 @@ class CipherApp(tk.Tk):
                 requests.get(f"{cc.BASE_URL}/", timeout=10).raise_for_status()
 
             def on_ok(_):
-                self._build_login_screen()
+                self._build_auth_screen()
 
             def on_err(err):
                 connect_btn.set_enabled(True)
@@ -312,84 +339,121 @@ class CipherApp(tk.Tk):
 
         connect_btn = RoundedButton(card, "Connect", do_connect)
         connect_btn.pack(anchor="w")
-        self.bind("<Return>", lambda e: do_connect())
 
     # ----------------------------------------------------------------
-    # Screen 2: register / continue with an identity
+    # Screen: sign up or log in (real Supabase account, email + password)
     # ----------------------------------------------------------------
 
-    def _build_login_screen(self):
+    def _build_auth_screen(self, mode: str = "login"):
         self._clear()
-        self.unbind("<Return>")
         self.configure(bg=C_MAIN_BG)
 
         card = tk.Frame(self, bg="#ffffff", padx=48, pady=40, highlightbackground="#e5e7eb", highlightthickness=1)
         card.place(relx=0.5, rely=0.5, anchor="center")
 
-        tk.Label(card, text="Welcome", font=font(20, "bold"), bg="#ffffff", fg=C_TEXT_DARK).pack(anchor="w")
-        subtitle = tk.Label(
-            card,
-            text="Enter your email. New here? We'll create a secure identity\nfor you automatically — no password needed.",
-            font=font(10), bg="#ffffff", fg=C_TEXT_MUTED, justify="left",
-        )
-        subtitle.pack(anchor="w", pady=(2, 20))
+        title_label = tk.Label(card, font=font(20, "bold"), bg="#ffffff", fg=C_TEXT_DARK)
+        title_label.pack(anchor="w")
+        subtitle_label = tk.Label(card, font=font(10), bg="#ffffff", fg=C_TEXT_MUTED, justify="left")
+        subtitle_label.pack(anchor="w", pady=(2, 20))
 
         tk.Label(card, text="EMAIL", font=font(8, "bold"), bg="#ffffff", fg=C_TEXT_MUTED).pack(anchor="w")
         email_entry = PlaceholderEntry(card, placeholder="you@example.com", width=42)
-        email_entry.pack(anchor="w", ipady=6, pady=(4, 8), fill="x")
+        email_entry.pack(anchor="w", ipady=6, pady=(4, 12), fill="x")
 
-        hint_label = tk.Label(card, text=" ", font=font(9), bg="#ffffff", fg=C_TEXT_MUTED)
-        hint_label.pack(anchor="w", pady=(0, 4))
+        tk.Label(card, text="PASSWORD", font=font(8, "bold"), bg="#ffffff", fg=C_TEXT_MUTED).pack(anchor="w")
+        password_entry = PlaceholderEntry(card, placeholder="••••••••", show="*", width=42)
+        password_entry.pack(anchor="w", ipady=6, pady=(4, 8), fill="x")
 
-        status_label = tk.Label(card, text="", font=font(9), bg="#ffffff", fg=C_ERROR, wraplength=340, justify="left")
+        status_label = tk.Label(card, text="", font=font(9), bg="#ffffff", fg=C_ERROR, wraplength=360, justify="left")
         status_label.pack(anchor="w", pady=(4, 16))
 
-        def update_hint(_e=None):
-            value = email_entry.value()
-            if not value:
-                hint_label.config(text=" ")
-                action_btn.config(text="Continue")
-            elif not EMAIL_RE.match(value):
-                hint_label.config(text="Enter a valid email address.", fg=C_ERROR)
-                action_btn.config(text="Continue")
-            elif cc.has_local_identity(value):
-                hint_label.config(text="Welcome back — we found your existing identity on this device.", fg=C_SUCCESS)
-                action_btn.config(text="Log In")
-            else:
-                hint_label.config(text="New identity — a secure keypair will be generated for you.", fg=C_TEXT_MUTED)
-                action_btn.config(text="Create Account")
-
-        email_entry.bind("<KeyRelease>", update_hint)
-
-        def do_continue():
-            email = email_entry.value()
+        def do_submit():
+            email, password = email_entry.value(), password_entry.value()
             if not email or not EMAIL_RE.match(email):
-                status_label.config(text="Enter a valid email address.")
+                status_label.config(text="Enter a valid email address.", fg=C_ERROR)
                 return
-            status_label.config(text="Setting up your identity…", fg=C_TEXT_MUTED)
+            if not password:
+                status_label.config(text="Enter a password.", fg=C_ERROR)
+                return
+
             action_btn.set_enabled(False)
 
-            def work():
-                cc.register(email)  # creates a local keypair if needed, publishes/updates it
+            if mode == "signup":
+                status_label.config(text="Creating your account…", fg=C_TEXT_MUTED)
 
-            def on_ok(_):
-                self.email = email
-                self._build_main_screen()
+                def work():
+                    return cc.sign_up(email, password)
 
-            def on_err(err):
-                action_btn.set_enabled(True)
-                status_label.config(text=str(err), fg=C_ERROR)
+                def on_ok(result):
+                    if not result.get("access_token"):
+                        action_btn.set_enabled(True)
+                        status_label.config(
+                            text="Account created — check your email to confirm it, then log in.",
+                            fg=C_SUCCESS,
+                        )
+                        self._build_auth_screen(mode="login")
+                        return
+                    self._finish_login(email, status_label, action_btn)
 
-            self.run_async(work, on_ok, on_err)
+                def on_err(err):
+                    action_btn.set_enabled(True)
+                    status_label.config(text=str(err), fg=C_ERROR)
 
-        action_btn = RoundedButton(card, "Continue", do_continue)
+                self.run_async(work, on_ok, on_err)
+            else:
+                status_label.config(text="Logging in…", fg=C_TEXT_MUTED)
+
+                def work():
+                    return cc.log_in(email, password)
+
+                def on_ok(_):
+                    self._finish_login(email, status_label, action_btn)
+
+                def on_err(err):
+                    action_btn.set_enabled(True)
+                    status_label.config(text=str(err), fg=C_ERROR)
+
+                self.run_async(work, on_ok, on_err)
+
+        if mode == "signup":
+            title_label.config(text="Create your account")
+            subtitle_label.config(text="Sets up a real login plus a secure messaging\nidentity — no separate steps needed.")
+            action_btn = RoundedButton(card, "Create Account", do_submit)
+            toggle_text = "Already have an account? Log in"
+            toggle_target = "login"
+        else:
+            title_label.config(text="Welcome back")
+            subtitle_label.config(text="Log in to continue.")
+            action_btn = RoundedButton(card, "Log In", do_submit)
+            toggle_text = "New here? Create an account"
+            toggle_target = "signup"
+
         action_btn.pack(anchor="w")
-        email_entry.bind("<Return>", lambda e: do_continue())
+        password_entry.bind("<Return>", lambda e: do_submit())
         email_entry.focus()
 
-        back_link = tk.Label(card, text="← change server", font=font(9), bg="#ffffff", fg=C_TEXT_MUTED, cursor="hand2")
-        back_link.pack(anchor="w", pady=(16, 0))
-        back_link.bind("<Button-1>", lambda e: self._build_connect_screen())
+        toggle_link = tk.Label(card, text=toggle_text, font=font(9), bg="#ffffff", fg=C_ACCENT, cursor="hand2")
+        toggle_link.pack(anchor="w", pady=(16, 0))
+        toggle_link.bind("<Button-1>", lambda e: self._build_auth_screen(mode=toggle_target))
+
+    def _finish_login(self, email: str, status_label, action_btn):
+        """Common tail of both login and signup: publish/refresh the
+        messaging identity (generates a local keypair on first use), then
+        move to the main screen."""
+        status_label.config(text="Setting up your messaging identity…", fg=C_TEXT_MUTED)
+
+        def work():
+            cc.register(email)
+
+        def on_ok(_):
+            self.email = email
+            self._build_main_screen()
+
+        def on_err(err):
+            action_btn.set_enabled(True)
+            status_label.config(text=str(err), fg=C_ERROR)
+
+        self.run_async(work, on_ok, on_err)
 
     # ----------------------------------------------------------------
     # Screen 3: main window
@@ -423,9 +487,9 @@ class CipherApp(tk.Tk):
         acc_text = tk.Frame(account_row, bg=C_SIDEBAR)
         acc_text.pack(side="left", padx=(8, 0), fill="x", expand=True)
         tk.Label(acc_text, text=self.email, font=font(9), bg=C_SIDEBAR, fg=C_SIDEBAR_TEXT, anchor="w").pack(fill="x")
-        switch_link = tk.Label(acc_text, text="Switch account", font=font(8), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT, cursor="hand2", anchor="w")
-        switch_link.pack(fill="x")
-        switch_link.bind("<Button-1>", lambda e: self._build_login_screen())
+        logout_link = tk.Label(acc_text, text="Log out", font=font(8), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT, cursor="hand2", anchor="w")
+        logout_link.pack(fill="x")
+        logout_link.bind("<Button-1>", lambda e: self._do_logout())
 
         divider = tk.Frame(sidebar, bg=C_SIDEBAR_BORDER, height=1)
         divider.pack(fill="x")
@@ -435,20 +499,8 @@ class CipherApp(tk.Tk):
         new_convo_btn = RoundedButton(actions, "+  New conversation", self._open_new_conversation_dialog, bg=C_ACCENT, hover_bg=C_ACCENT_HOVER)
         new_convo_btn.pack(fill="x")
 
-        # Invites section
-        invites_label = tk.Frame(sidebar, bg=C_SIDEBAR, padx=18)
-        invites_label.pack(fill="x")
-        tk.Label(invites_label, text="PENDING INVITES", font=font(8, "bold"), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT).pack(anchor="w", pady=(4, 6))
-
-        self.invites_scroll = ScrollableFrame(sidebar, bg=C_SIDEBAR)
-        self.invites_scroll.pack(fill="x", padx=8, pady=(0, 8), max_height=100)
-
-        list_label = tk.Frame(sidebar, bg=C_SIDEBAR, padx=18)
-        list_label.pack(fill="x")
-        tk.Label(list_label, text="CONVERSATIONS", font=font(8, "bold"), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT).pack(anchor="w", pady=(4, 6))
-
         self.convo_scroll = ScrollableFrame(sidebar, bg=C_SIDEBAR)
-        self.convo_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.convo_scroll.pack(fill="both", expand=True, padx=8, pady=(4, 8))
 
         # ---------------- Chat area ----------------
         chat_area = tk.Frame(root, bg=C_MAIN_BG)
@@ -475,14 +527,21 @@ class CipherApp(tk.Tk):
         self.compose_entry.bind("<Return>", lambda e: self._send_current_message())
         self.send_btn = RoundedButton(composer, "Send", self._send_current_message)
         self.send_btn.grid(row=0, column=1)
+        self._set_composer_enabled(False)
 
         self._refresh_conversations()
         self._schedule_refresh()
 
+    def _do_logout(self):
+        cc.log_out()
+        self.email = None
+        self.conversations = []
+        self.selected_conversation_id = None
+        self._build_auth_screen(mode="login")
+
     def _schedule_refresh(self):
         self._refresh_conversations()
-        self._refresh_pending_invites()
-        if self.selected_conversation_id:
+        if self.selected_conversation_id and str(self.compose_entry.cget("state")) == "normal":
             self._refresh_messages(self.selected_conversation_id, preserve_scroll=True)
         self._refresh_job = self.after(REFRESH_MS, self._schedule_refresh)
 
@@ -492,70 +551,14 @@ class CipherApp(tk.Tk):
             self.messages_scroll.inner, text=text, font=font(10), bg=C_MAIN_BG, fg=C_TEXT_MUTED,
         ).pack(pady=40)
 
-    # ---- invites ----
+    def _set_composer_enabled(self, enabled: bool):
+        self.compose_entry.config(state="normal" if enabled else "disabled")
+        self.send_btn.set_enabled(enabled)
 
-    def _refresh_pending_invites(self):
-        def work():
-            return cc.get_pending_invites(self.email)
-
-        def on_ok(invites):
-            self.pending_invites = invites or []
-            self.invites_scroll.clear()
-            if not self.pending_invites:
-                tk.Label(
-                    self.invites_scroll.inner, text="No pending invites.", font=font(9), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT,
-                    wraplength=220, justify="left",
-                ).pack(anchor="w", padx=10, pady=10)
-            for invite in self.pending_invites:
-                self._add_invite_row(invite)
-
-        def on_err(err):
-            self._show_error("Couldn't load invites", err)
-
-        self.run_async(work, on_ok, on_err)
-
-    def _add_invite_row(self, invite: dict):
-        row = tk.Frame(self.invites_scroll.inner, bg="#2a3547", padx=10, pady=8)
-        row.pack(fill="x", pady=1)
-
-        # Display conversation ID and role
-        convo_id = invite["conversation_id"][:8] + "..."
-        tk.Label(row, text=f"Invite to {convo_id}", font=font(9), bg="#2a3547", fg=C_SIDEBAR_TEXT, anchor="w").pack(fill="x", pady=(0, 6))
-
-        # Accept/Decline buttons
-        button_frame = tk.Frame(row, bg="#2a3547")
-        button_frame.pack(fill="x")
-
-        def accept():
-            def work():
-                cc.respond_to_invite(invite["id"], accept=True)
-
-            def on_ok(_):
-                self._refresh_pending_invites()
-                self._refresh_conversations()
-
-            def on_err(err):
-                self._show_error("Couldn't accept invite", err)
-
-            self.run_async(work, on_ok, on_err)
-
-        def decline():
-            def work():
-                cc.respond_to_invite(invite["id"], accept=False)
-
-            def on_ok(_):
-                self._refresh_pending_invites()
-
-            def on_err(err):
-                self._show_error("Couldn't decline invite", err)
-
-            self.run_async(work, on_ok, on_err)
-
-        accept_btn = RoundedButton(button_frame, "Accept", accept, bg=C_SUCCESS, hover_bg=C_SUCCESS_HOVER, pad=(10, 6))
-        accept_btn.pack(side="left", padx=(0, 4))
-
-        decline_btn = RoundedButton(button_frame, "Decline", decline, bg="#6b7280", hover_bg="#4b5563", pad=(10, 6))
-        decline_btn.pack(side="left")
+    def _participant_status(self, convo: dict) -> str:
+        if convo.get("creator_email") == self.email:
+            return "accepted"
+        return (convo.get("participant_status") or {}).get(self.email, "pending")
 
     # ---- conversations ----
 
@@ -564,15 +567,30 @@ class CipherApp(tk.Tk):
             return cc.list_conversations_data(self.email)
 
         def on_ok(convos):
-            self.conversations = convos or []
+            self.conversations = [c for c in (convos or []) if self._participant_status(c) != "declined"]
             self.convo_scroll.clear()
-            if not self.conversations:
+
+            pending = [c for c in self.conversations if self._participant_status(c) == "pending"]
+            active = [c for c in self.conversations if self._participant_status(c) != "pending"]
+
+            if pending:
+                tk.Label(
+                    self.convo_scroll.inner, text="INVITATIONS", font=font(8, "bold"), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT,
+                ).pack(anchor="w", padx=10, pady=(4, 4))
+                for c in pending:
+                    self._add_conversation_row(c)
+                tk.Frame(self.convo_scroll.inner, bg=C_SIDEBAR_BORDER, height=1).pack(fill="x", pady=8, padx=10)
+
+            tk.Label(
+                self.convo_scroll.inner, text="CONVERSATIONS", font=font(8, "bold"), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT,
+            ).pack(anchor="w", padx=10, pady=(0, 4))
+            if not active:
                 tk.Label(
                     self.convo_scroll.inner, text="No conversations yet.", font=font(9), bg=C_SIDEBAR, fg=C_SIDEBAR_SUBTEXT,
                     wraplength=220, justify="left",
-                ).pack(anchor="w", padx=10, pady=10)
-            for convo in self.conversations:
-                self._add_conversation_row(convo)
+                ).pack(anchor="w", padx=10, pady=6)
+            for c in active:
+                self._add_conversation_row(c)
 
         def on_err(err):
             self._show_error("Couldn't load conversations", err)
@@ -581,6 +599,7 @@ class CipherApp(tk.Tk):
 
     def _add_conversation_row(self, convo: dict):
         is_selected = convo["id"] == self.selected_conversation_id
+        is_pending = self._participant_status(convo) == "pending"
         row_bg = C_SIDEBAR_ROW_SELECTED if is_selected else C_SIDEBAR
         row = tk.Frame(self.convo_scroll.inner, bg=row_bg, padx=10, pady=10, cursor="hand2")
         row.pack(fill="x", pady=1)
@@ -589,8 +608,12 @@ class CipherApp(tk.Tk):
         label = convo.get("name") or (", ".join(others) if others else "Just you")
         tk.Label(row, text=label, font=font(10, "bold"), bg=row_bg, fg=C_SIDEBAR_TEXT, anchor="w").pack(fill="x")
 
-        preview = "Encrypted messages" if convo.get("last_message_preview") else "No messages yet"
-        tk.Label(row, text=preview, font=font(8), bg=row_bg, fg=C_SIDEBAR_SUBTEXT, anchor="w").pack(fill="x")
+        if is_pending:
+            subtitle, subtitle_color = f"Invited by {convo.get('creator_email', 'someone')}", C_WARNING
+        else:
+            subtitle = "Encrypted messages" if convo.get("last_message_preview") else "No messages yet"
+            subtitle_color = C_SIDEBAR_SUBTEXT
+        tk.Label(row, text=subtitle, font=font(8), bg=row_bg, fg=subtitle_color, anchor="w").pack(fill="x")
 
         def select(_e=None):
             self._on_select_conversation(convo)
@@ -630,6 +653,7 @@ class CipherApp(tk.Tk):
             self.selected_conversation_id = new_id
             self._refresh_conversations()
             self.chat_title_label.config(text=name or ", ".join(participants))
+            self._set_composer_enabled(True)
             self._refresh_messages(new_id)
 
         def on_err(err):
@@ -642,7 +666,48 @@ class CipherApp(tk.Tk):
         others = [p for p in convo["participants"] if p != self.email]
         self.chat_title_label.config(text=convo.get("name") or (", ".join(others) if others else "Just you"))
         self._refresh_conversations()  # redraw sidebar so the selected row highlights
-        self._refresh_messages(convo["id"])
+
+        if self._participant_status(convo) == "pending":
+            self._set_composer_enabled(False)
+            self._show_invitation_card(convo)
+        else:
+            self._set_composer_enabled(True)
+            self._refresh_messages(convo["id"])
+
+    def _show_invitation_card(self, convo: dict):
+        self.messages_scroll.clear()
+        card = tk.Frame(self.messages_scroll.inner, bg="#ffffff", padx=30, pady=26, highlightbackground=C_HEADER_BORDER, highlightthickness=1)
+        card.pack(pady=60, padx=40)
+
+        tk.Label(card, text="You've been invited to a conversation", font=font(12, "bold"), bg="#ffffff", fg=C_TEXT_DARK).pack(anchor="w")
+        tk.Label(
+            card, text=f"From: {convo.get('creator_email', 'someone')}", font=font(9), bg="#ffffff", fg=C_TEXT_MUTED,
+        ).pack(anchor="w", pady=(4, 16))
+
+        btn_row = tk.Frame(card, bg="#ffffff")
+        btn_row.pack(anchor="w")
+
+        def respond(accept: bool):
+            def work():
+                cc.respond_to_invitation(convo["id"], accept)
+
+            def on_ok(_):
+                if accept:
+                    self._set_composer_enabled(True)
+                    self._refresh_messages(convo["id"])
+                else:
+                    self.selected_conversation_id = None
+                    self.chat_title_label.config(text="Select a conversation")
+                    self._show_empty_state("Select a conversation, or start a new one.")
+                self._refresh_conversations()
+
+            def on_err(err):
+                self._show_error("Couldn't respond to invitation", err)
+
+            self.run_async(work, on_ok, on_err)
+
+        RoundedButton(btn_row, "Accept", lambda: respond(True), bg=C_SUCCESS, hover_bg=C_SUCCESS_HOVER).pack(side="left", padx=(0, 8))
+        RoundedButton(btn_row, "Decline", lambda: respond(False), bg=C_DECLINE, hover_bg=C_DECLINE_HOVER).pack(side="left")
 
     # ---- messages ----
 
