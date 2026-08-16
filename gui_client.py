@@ -44,9 +44,9 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 #
 # Leave any of these blank to keep a manual "enter connection details"
 # screen on launch (handy while you're still developing/testing).
-DEFAULT_CIPHER_API_URL = ""    # e.g. "https://your-service.onrender.com"
-DEFAULT_SUPABASE_URL = ""      # e.g. "https://xxxxxxxx.supabase.co"
-DEFAULT_SUPABASE_ANON_KEY = ""  # Settings -> API -> Project API keys -> anon/public
+DEFAULT_CIPHER_API_URL = "https://cipher-messaging-api.onrender.com"    # e.g. "https://your-service.onrender.com"
+DEFAULT_SUPABASE_URL = "https://gebanlqunirbitsbyypf.supabase.co/rest/v1/"      # e.g. "https://xxxxxxxx.supabase.co"
+DEFAULT_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdlYmFubHF1bmlyYml0c2J5eXBmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY1MzI1ODIsImV4cCI6MjEwMjEwODU4Mn0.mP6ytZcjdHFEA0LXFCWmF8jFOiI4P1mTs42cRFhOgi0"  # Settings -> API -> Project API keys -> anon/public
 
 # ---------------------------------------------------------------------------
 # Palette / type scale — kept in one place so the look stays consistent.
