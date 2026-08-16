@@ -4,9 +4,18 @@ cipher_client.py — End-to-end encrypted messaging client for your
 self-hosted Cipher Messaging API (see the `server/` folder — deploy it
 free on Render).
 
-Configure with environment variables before running:
+Configure with environment variables before running (or call configure()
+programmatically, as the GUI does):
     export CIPHER_API_URL="https://<your-service-name>.onrender.com"
-    export CIPHER_API_KEY="<the API_KEY you set on the server>"
+    export SUPABASE_URL="https://<your-project>.supabase.co"
+    export SUPABASE_ANON_KEY="<your project's anon/public key>"
+
+Authentication is real per-user accounts via Supabase Auth (email +
+password) — call sign_up()/log_in() to get a session, then everything
+else (register, send, read, ...) uses that session automatically. There
+is no shared API key: SUPABASE_URL and SUPABASE_ANON_KEY are meant to
+be public (Supabase's own design), so they're safe to bake into a
+distributed app. See server/README.md for what's server-only.
 
 DESIGN
 ------
@@ -38,11 +47,14 @@ of this file before using it for anything sensitive.
 
 USAGE
 -----
-    python3 cipher_client.py register alice@example.com
-    python3 cipher_client.py register bob@example.com
+    python3 cipher_client.py signup alice@example.com
+    python3 cipher_client.py signup bob@example.com
 
     python3 cipher_client.py create-conversation alice@example.com \\
         --with bob@example.com --name "Alice & Bob"
+
+    python3 cipher_client.py invitations bob@example.com
+    python3 cipher_client.py respond bob@example.com <conversation_id> accept
 
     python3 cipher_client.py send alice@example.com <conversation_id> \\
         "hey bob, this is encrypted end to end"
@@ -54,6 +66,7 @@ USAGE
 
 import argparse
 import base64
+import getpass
 import os
 import sys
 import time
@@ -71,62 +84,158 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 # --------------------------------------------------------------------------
 
 BASE_URL = os.environ.get("CIPHER_API_URL", "http://127.0.0.1:8000")
-API_KEY = os.environ.get("CIPHER_API_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 KEY_DIR = Path.home() / ".cipher_messaging"
 HKDF_INFO = b"cipher-messaging-cek-wrap-v1"
 
+ACCESS_TOKEN: str | None = None
+REFRESH_TOKEN: str | None = None
+CURRENT_EMAIL: str | None = None  # set on successful sign-up/log-in
+
 
 class CipherClientError(Exception):
-    """Raised for expected, user-facing problems (bad config, missing key,
-    unknown recipient, etc). Callers such as the GUI can catch this
-    specifically instead of crashing, unlike SystemExit which is meant
-    only for a command-line process exiting."""
+    """Raised for expected, user-facing problems (bad config, wrong
+    password, unknown recipient, etc). Callers such as the GUI can catch
+    this specifically instead of crashing, unlike SystemExit which is
+    meant only for a command-line process exiting."""
 
 
-def configure(base_url: str | None = None, api_key: str | None = None) -> None:
-    """Set the server URL / API key at runtime (used by the GUI's connect
-    dialog). Falls back to CIPHER_API_URL / CIPHER_API_KEY env vars if
-    never called."""
-    global BASE_URL, API_KEY
+def configure(base_url: str | None = None, supabase_url: str | None = None, supabase_anon_key: str | None = None) -> None:
+    """Set the backend URL / Supabase project details at runtime (used
+    by the GUI). Falls back to CIPHER_API_URL / SUPABASE_URL /
+    SUPABASE_ANON_KEY env vars if never called."""
+    global BASE_URL, SUPABASE_URL, SUPABASE_ANON_KEY
     if base_url:
         BASE_URL = base_url.rstrip("/")
-    if api_key:
-        API_KEY = api_key
+    if supabase_url:
+        SUPABASE_URL = supabase_url.rstrip("/")
+    if supabase_anon_key:
+        SUPABASE_ANON_KEY = supabase_anon_key
 
 
-def _headers() -> dict:
-    if not API_KEY:
-        raise CipherClientError(
-            "No server configured. Set CIPHER_API_KEY (and optionally "
-            "CIPHER_API_URL) as environment variables, or call configure()."
-        )
-    return {"x-api-key": API_KEY, "Content-Type": "application/json"}
+def is_logged_in() -> bool:
+    return ACCESS_TOKEN is not None
+
+
+def log_out() -> None:
+    global ACCESS_TOKEN, REFRESH_TOKEN, CURRENT_EMAIL
+    ACCESS_TOKEN = None
+    REFRESH_TOKEN = None
+    CURRENT_EMAIL = None
 
 
 # --------------------------------------------------------------------------
-# HTTP helpers
+# Supabase Auth — real per-user accounts (email + password), no shared key.
+# --------------------------------------------------------------------------
+
+def _supabase_headers() -> dict:
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise CipherClientError(
+            "Supabase is not configured. Set SUPABASE_URL and SUPABASE_ANON_KEY "
+            "(env vars, or via configure())."
+        )
+    return {"apikey": SUPABASE_ANON_KEY, "Content-Type": "application/json"}
+
+
+def _supabase_error_message(resp: requests.Response) -> str:
+    try:
+        body = resp.json()
+        return body.get("error_description") or body.get("msg") or body.get("message") or resp.text
+    except ValueError:
+        return resp.text
+
+
+def _store_session(data: dict) -> None:
+    global ACCESS_TOKEN, REFRESH_TOKEN, CURRENT_EMAIL
+    ACCESS_TOKEN = data.get("access_token")
+    REFRESH_TOKEN = data.get("refresh_token")
+    user = data.get("user") or {}
+    CURRENT_EMAIL = user.get("email")
+
+
+def sign_up(email: str, password: str) -> dict:
+    """Create a new Supabase auth account. Returns the raw Supabase
+    response. If your project requires email confirmation, the response
+    won't include an access_token yet — tell the user to check their
+    inbox, then call log_in() once they've clicked the link."""
+    resp = requests.post(
+        f"{SUPABASE_URL}/auth/v1/signup",
+        headers=_supabase_headers(),
+        json={"email": email, "password": password},
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        raise CipherClientError(_supabase_error_message(resp))
+    data = resp.json()
+    if data.get("access_token"):
+        _store_session(data)
+    return data
+
+
+def log_in(email: str, password: str) -> dict:
+    """Log into an existing Supabase auth account."""
+    resp = requests.post(
+        f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
+        headers=_supabase_headers(),
+        json={"email": email, "password": password},
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        raise CipherClientError(_supabase_error_message(resp))
+    data = resp.json()
+    _store_session(data)
+    return data
+
+
+def _refresh_session() -> bool:
+    if not REFRESH_TOKEN:
+        return False
+    resp = requests.post(
+        f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
+        headers=_supabase_headers(),
+        json={"refresh_token": REFRESH_TOKEN},
+        timeout=30,
+    )
+    if resp.status_code >= 400:
+        return False
+    _store_session(resp.json())
+    return True
+
+
+# --------------------------------------------------------------------------
+# HTTP helpers (calls to OUR backend, authenticated with the Supabase
+# session obtained above)
 # --------------------------------------------------------------------------
 
 def _url(path: str) -> str:
     return f"{BASE_URL}{path}"
 
 
-def api_get(path: str, params: dict | None = None) -> dict | list:
-    resp = requests.get(_url(path), headers=_headers(), params=params, timeout=30)
+def _auth_headers() -> dict:
+    if not ACCESS_TOKEN:
+        raise CipherClientError("Not logged in. Call log_in() or sign_up() first.")
+    return {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+
+
+def _request(method: str, path: str, **kwargs) -> dict | list:
+    resp = requests.request(method, _url(path), headers=_auth_headers(), timeout=30, **kwargs)
+    if resp.status_code == 401 and _refresh_session():
+        resp = requests.request(method, _url(path), headers=_auth_headers(), timeout=30, **kwargs)
     resp.raise_for_status()
     return resp.json()
+
+
+def api_get(path: str, params: dict | None = None) -> dict | list:
+    return _request("GET", path, params=params)
 
 
 def api_post(path: str, payload: dict) -> dict:
-    resp = requests.post(_url(path), headers=_headers(), json=payload, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    return _request("POST", path, json=payload)
 
 
 def api_put(path: str, payload: dict) -> dict:
-    resp = requests.put(_url(path), headers=_headers(), json=payload, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    return _request("PUT", path, json=payload)
 
 
 # --------------------------------------------------------------------------
@@ -247,22 +356,20 @@ def register(email: str) -> None:
 # --------------------------------------------------------------------------
 
 def create_conversation(creator_email: str, participants: list[str], name: str | None) -> str:
-    all_participants = sorted(set(participants + [creator_email]))
-    payload = {
-        "participants": all_participants,
-        "creator_email": creator_email,
-    }
+    payload = {"participants": participants}
     if name:
         payload["name"] = name
     result = api_post("/conversations", payload)
-    print(f"Created conversation {result['id']} with {all_participants}")
-    print(f"Invitations sent to: {', '.join([p for p in all_participants if p != creator_email])}")
+    invited = [p for p in result["participants"] if p != creator_email]
+    print(f"Created conversation {result['id']}; invitations sent to {invited}")
     return result["id"]
 
 
 def list_conversations_data(email: str) -> list[dict]:
-    """Data-returning version for programmatic use (e.g. the GUI)."""
-    return api_get("/conversations", params={"participant": email})
+    """Data-returning version for programmatic use (e.g. the GUI). `email`
+    is accepted for signature stability but not sent in the request — the
+    server derives the caller's identity from the auth token."""
+    return api_get("/conversations")
 
 
 def list_conversations(email: str) -> None:
@@ -272,38 +379,15 @@ def list_conversations(email: str) -> None:
         print("No conversations.")
         return
     for c in convos:
+        status = c["participant_status"].get(email, "accepted" if c["creator_email"] == email else "pending")
         preview = c.get("last_message_preview")
         note = "(has messages)" if preview else "(empty)"
-        print(f"- {c['id']}  name={c.get('name') or '(unnamed)'}  {note}  participants={c['participants']}")
+        print(f"- {c['id']}  name={c.get('name') or '(unnamed)'}  [{status}]  {note}  participants={c['participants']}")
 
 
-# --------------------------------------------------------------------------
-# Invites
-# --------------------------------------------------------------------------
-
-def get_pending_invites(email: str) -> list[dict]:
-    """Fetch all pending conversation invites for a user."""
-    return api_get("/memberships/pending", params={"email": email})
-
-
-def list_pending_invites(email: str) -> None:
-    """CLI wrapper: prints pending invites."""
-    invites = get_pending_invites(email)
-    if not invites:
-        print("No pending invites.")
-        return
-    for invite in invites:
-        convo_id = invite["conversation_id"]
-        membership_id = invite["id"]
-        print(f"- Invite {membership_id} for conversation {convo_id}")
-
-
-def respond_to_invite(membership_id: str, accept: bool) -> None:
-    """Accept or decline a conversation invite."""
-    status = "accepted" if accept else "declined"
-    api_put(f"/memberships/{membership_id}", {"status": status})
-    action = "accepted" if accept else "declined"
-    print(f"Invite {action}: {membership_id}")
+def respond_to_invitation(conversation_id: str, accept: bool) -> dict:
+    """Accept or decline a pending conversation invitation."""
+    return api_post(f"/conversations/{conversation_id}/respond", {"status": "accepted" if accept else "declined"})
 
 
 # --------------------------------------------------------------------------
@@ -439,19 +523,30 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="End-to-end encrypted client for Cipher Messaging.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("register", help="Generate (or reuse) a local keypair and publish the public key.")
+    p = sub.add_parser("signup", help="Create a new account, then generate/publish your messaging identity.")
     p.add_argument("email")
 
-    p = sub.add_parser("create-conversation", help="Start a new conversation.")
-    p.add_argument("email", help="Your email (must be registered)")
+    p = sub.add_parser("login", help="Log into an existing account, then publish your messaging identity.")
+    p.add_argument("email")
+
+    p = sub.add_parser("create-conversation", help="Start a new conversation (invites the other participants).")
+    p.add_argument("email", help="Your email (must be logged in)")
     p.add_argument("--with", dest="with_", nargs="+", required=True, help="Other participant email(s)")
     p.add_argument("--name", default=None)
 
-    p = sub.add_parser("list-conversations", help="List conversations you're part of.")
+    p = sub.add_parser("list-conversations", help="List conversations and invitations you're part of.")
     p.add_argument("email")
 
+    p = sub.add_parser("invitations", help="List only pending conversation invitations.")
+    p.add_argument("email")
+
+    p = sub.add_parser("respond", help="Accept or decline a conversation invitation.")
+    p.add_argument("email")
+    p.add_argument("conversation_id")
+    p.add_argument("decision", choices=["accept", "decline"])
+
     p = sub.add_parser("send", help="Send an encrypted message.")
-    p.add_argument("email", help="Your email (must be registered)")
+    p.add_argument("email", help="Your email (must be logged in and have accepted the conversation)")
     p.add_argument("conversation_id")
     p.add_argument("text")
     p.add_argument("--disappear-after", type=int, default=None, metavar="SECONDS")
@@ -460,34 +555,44 @@ def main() -> None:
     p.add_argument("email")
     p.add_argument("conversation_id")
 
-    p = sub.add_parser("list-invites", help="List pending conversation invites.")
-    p.add_argument("email", help="Your email")
-
-    p = sub.add_parser("accept-invite", help="Accept a conversation invite.")
-    p.add_argument("membership_id", help="The invite membership ID")
-
-    p = sub.add_parser("decline-invite", help="Decline a conversation invite.")
-    p.add_argument("membership_id", help="The invite membership ID")
-
     args = parser.parse_args()
 
     try:
-        if args.command == "register":
+        if args.command == "signup":
+            password = getpass.getpass(f"Choose a password for {args.email}: ")
+            confirm = getpass.getpass("Confirm password: ")
+            if password != confirm:
+                raise CipherClientError("Passwords did not match.")
+            result = sign_up(args.email, password)
+            if not result.get("access_token"):
+                print("Account created. Check your email to confirm it, then run 'login'.")
+            else:
+                register(args.email)
+                print(f"Signed up and registered {args.email}.")
+        elif args.command == "login":
+            password = getpass.getpass(f"Password for {args.email}: ")
+            log_in(args.email, password)
             register(args.email)
+            print(f"Logged in as {args.email}.")
         elif args.command == "create-conversation":
             create_conversation(args.email, args.with_, args.name)
         elif args.command == "list-conversations":
             list_conversations(args.email)
+        elif args.command == "invitations":
+            convos = list_conversations_data(args.email)
+            pending = [c for c in convos if c["participant_status"].get(args.email) == "pending"]
+            if not pending:
+                print("No pending invitations.")
+            for c in pending:
+                others = [p for p in c["participants"] if p != args.email]
+                print(f"- {c['id']}  name={c.get('name') or '(unnamed)'}  from={c['creator_email']}  with={others}")
+        elif args.command == "respond":
+            respond_to_invitation(args.conversation_id, args.decision == "accept")
+            print(f"{args.decision}ed invitation to {args.conversation_id}.")
         elif args.command == "send":
             send_message(args.email, args.conversation_id, args.text, args.disappear_after)
         elif args.command == "read":
             read_conversation(args.email, args.conversation_id)
-        elif args.command == "list-invites":
-            list_pending_invites(args.email)
-        elif args.command == "accept-invite":
-            respond_to_invite(args.membership_id, accept=True)
-        elif args.command == "decline-invite":
-            respond_to_invite(args.membership_id, accept=False)
     except (requests.exceptions.ConnectionError, requests.HTTPError, CipherClientError) as e:
         if isinstance(e, requests.HTTPError):
             body = e.response.text if e.response is not None else ""
@@ -502,12 +607,11 @@ if __name__ == "__main__":
 # --------------------------------------------------------------------------
 # Limitations (read before relying on this for anything sensitive)
 # --------------------------------------------------------------------------
-# * The server's x-api-key is a single shared secret gating the whole
-#   deployment — it does not authenticate individual users against each
-#   other. Anyone holding that key could publish a fake public key under
-#   someone else's email (a MITM/impersonation risk). A real system needs
-#   per-user auth (e.g. JWTs) plus key-verification (safety numbers, a
-#   trusted directory, etc.).
+# * Auth is now real per-user accounts (Supabase Auth, email + password) —
+#   no more shared secret. But it's still just password auth: anyone who
+#   guesses/phishes a password can log in as that user and publish a new
+#   Identity for their email, impersonating them going forward. Consider
+#   requiring 2FA (Supabase supports it) for anything beyond casual use.
 # * Private keys sit unencrypted on disk under ~/.cipher_messaging. Add a
 #   passphrase-derived wrapping key if this leaves a trusted machine.
 # * No forward secrecy — static ECDH keys mean a compromised private key
