@@ -7,7 +7,12 @@ client (`cipher_client.py` / `gui_client.py`).
 
 Real user accounts are handled by **Supabase Auth** — no shared API
 key baked into the app. Each user signs up with an email + password;
-the server verifies their session token on every request.
+on every request, this server asks Supabase's own Auth server whether
+the caller's token is still valid (rather than verifying the JWT
+locally), which works regardless of whether your project signs tokens
+with the older shared-secret scheme or the newer asymmetric one —
+Supabase has been migrating projects between the two, and this way
+there's nothing here to keep in sync with that.
 
 ## 1. Set up Supabase (auth + database)
 
@@ -19,20 +24,28 @@ the server verifies their session token on every request.
    Providers → Email** and turn **off** "Confirm email", so new accounts
    can log in immediately instead of needing to click a confirmation
    link first. (Leave it on for anything beyond personal testing.)
-3. You'll need three values out of this project, used in two very
-   different places:
+3. You'll need two values out of this project — and unusually, **both
+   go in two places**: baked into the client app *and* set as env vars
+   on this server. That's fine, since neither is a secret:
 
-   | Value | Where to find it | Goes where | Secret? |
-   |---|---|---|---|
-   | Project URL | Settings → API → Project URL | baked into the **client app** | No — public by design |
-   | `anon` / `public` key | Settings → API → Project API keys | baked into the **client app** | No — public by design |
-   | JWT Secret | Settings → API → JWT Settings → JWT Secret | set on **this server** (Render env var) | **Yes** — never ship this |
+   | Value | Where to find it | Secret? |
+   |---|---|---|
+   | Project URL | Settings → API → Project URL | No — public by design |
+   | Publishable key (`sb_publishable_...`) | Settings → API Keys | No — public by design |
 
-   Supabase's anon key is intentionally safe to embed in a distributed
-   app — it identifies the *project*, not a *user*; real access control
-   happens via the JWT Secret check this server performs. The JWT
-   Secret is what actually verifies a token wasn't forged, so it must
-   stay server-side only.
+   Supabase's publishable key (the modern replacement for the older
+   "anon key" — same purpose, same low privilege level) is intentionally
+   safe to embed in a distributed app — it identifies the *project*, not
+   a *user*. The server uses the same two values to ask Supabase "is
+   this token valid, and whose is it?" on each request — that's what
+   actually gates access, not the key itself.
+
+   Note: this app never queries Supabase's own database tables directly
+   from the client (that's the scenario where Supabase's Row Level
+   Security warning applies) — the publishable key is only used to talk
+   to Supabase Auth, and all messaging data goes through this server,
+   which enforces its own access control. You don't need to set up RLS
+   policies for this project.
 
 ## 2. Deploy the server to Render (free tier)
 
@@ -40,7 +53,8 @@ the server verifies their session token on every request.
 2. In Render: **New → Blueprint**, point it at your repo. It reads
    `render.yaml` and creates the service, prompting you to fill in the
    env vars it can't generate itself:
-   - `SUPABASE_JWT_SECRET` — from the table above
+   - `SUPABASE_URL` / `SUPABASE_ANON_KEY` — from the table above (same
+     values you'll put in the client app)
    - `DATABASE_URL` — see step 3 below
    - Doing it by hand instead (**New → Web Service**)? Set:
      - **Root Directory:** `server`
@@ -76,16 +90,17 @@ show up under **Authentication → Users**.
 ## 3. Configure the client app
 
 In `gui_client.py`, fill in the `DEFAULT_*` constants near the top with
-the Project URL + anon key from step 1, plus your Render URL from step
-2. These three are safe to bake in and ship — see the comment above
-them for why. Nothing else needs configuring; end users just sign up
-or log in with email + password.
+the Project URL + publishable key from step 1, plus your Render URL
+from step 2. These three are safe to bake in and ship — see the
+comment above them for why. Nothing else needs configuring; end users
+just sign up or log in with email + password.
 
 ## Run the server locally
 
 ```bash
 pip install -r requirements.txt
-export SUPABASE_JWT_SECRET=...   # from your Supabase project
+export SUPABASE_URL=https://your-project.supabase.co
+export SUPABASE_ANON_KEY=sb_publishable_...
 uvicorn main:app --reload
 ```
 
@@ -102,8 +117,9 @@ creator is always auto-accepted.
 ## Security notes
 
 - **Auth:** every request (besides the health check) needs
-  `Authorization: Bearer <token>`, where the token comes from Supabase
-  Auth and is verified here against `SUPABASE_JWT_SECRET`. A user can
+  `Authorization: Bearer <token>`. This server checks that token against
+  Supabase's own Auth server on every call — a small latency cost, but
+  no JWT-verification logic or secret to keep in sync here. A user can
   only publish an `Identity` for their own authenticated email, and can
   only send messages as themselves — no more shared-key impersonation
   risk.
