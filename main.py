@@ -17,12 +17,17 @@ Message       — one encrypted message, with a per-recipient sealed
 
 Auth: every request (except the health check) must send
 `Authorization: Bearer <supabase access token>`. Tokens are issued by
-Supabase Auth (the client signs up / logs in directly against Supabase)
-and verified here using SUPABASE_JWT_SECRET — found in your Supabase
-project under Settings -> API -> JWT Settings -> JWT Secret. This is a
-SERVER-ONLY secret: never put it in a distributed client app. (The
-Supabase URL and anon/public key the client uses to talk to Supabase
-Auth are, by contrast, meant to be public — see README.md.)
+Supabase Auth (the client signs up / logs in directly against Supabase).
+Rather than verify the JWT locally (which requires tracking whether your
+project uses legacy HS256 or the newer asymmetric ES256 signing keys —
+Supabase has been migrating projects between these), this server takes
+the simpler, algorithm-agnostic route Supabase itself recommends: it
+asks Supabase's own Auth server whether the token is valid on each
+request (GET /auth/v1/user). That costs a small bit of latency per
+request but needs no server-only JWT secret at all, and keeps working
+regardless of which signing scheme your project uses now or switches to
+later. SUPABASE_URL and the publishable key (same values baked into the
+client app — see README.md) are all this server needs.
 
 Invitations: when a conversation is created, every participant besides
 the creator starts out "pending". They can't send or read messages in
@@ -37,7 +42,8 @@ see README.md for the connection string to use.
 
 Run locally:
     pip install -r requirements.txt
-    export SUPABASE_JWT_SECRET=...   # from your Supabase project
+    export SUPABASE_URL=https://your-project.supabase.co
+    export SUPABASE_ANON_KEY=sb_publishable_...
     uvicorn main:app --reload
 """
 
@@ -46,7 +52,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
-import jwt
+import requests
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -58,16 +64,18 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 # Config
 # --------------------------------------------------------------------------
 
-SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./data.db")
 
-if not SUPABASE_JWT_SECRET:
+if not SUPABASE_URL or not SUPABASE_ANON_KEY:
     raise RuntimeError(
-        "SUPABASE_JWT_SECRET environment variable is not set. Find it in "
-        "your Supabase project: Settings -> API -> JWT Settings -> JWT "
-        "Secret, then set it on Render's Environment tab. This is separate "
-        "from the Supabase URL/anon key baked into the client app."
+        "SUPABASE_URL and/or SUPABASE_ANON_KEY environment variables are not "
+        "set. Use the same Project URL and publishable key baked into the "
+        "client app (Settings -> API in your Supabase project) — neither is "
+        "a secret, so it's fine that they're set here too."
     )
+SUPABASE_URL = SUPABASE_URL.rstrip("/")
 
 # Some providers hand out `postgres://` (old Heroku-style); SQLAlchemy 1.4+
 # requires the `postgresql://` scheme. Supabase already gives you the
@@ -153,7 +161,10 @@ def get_db():
 
 
 # --------------------------------------------------------------------------
-# Auth — verify a Supabase-issued JWT and extract the caller's email.
+# Auth — ask Supabase's own Auth server whether the token is valid, and
+# who it belongs to. Slightly slower than local JWT verification, but
+# works regardless of whether the project uses legacy HS256 or the newer
+# asymmetric ES256 signing keys, with nothing to keep in sync here.
 # --------------------------------------------------------------------------
 
 bearer_scheme = HTTPBearer(auto_error=True)
@@ -162,14 +173,18 @@ bearer_scheme = HTTPBearer(auto_error=True)
 def require_auth(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)) -> str:
     token = credentials.credentials
     try:
-        payload = jwt.decode(
-            token, SUPABASE_JWT_SECRET, algorithms=["HS256"], audience="authenticated"
+        resp = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={"Authorization": f"Bearer {token}", "apikey": SUPABASE_ANON_KEY},
+            timeout=10,
         )
-    except jwt.PyJWTError as e:
-        raise HTTPException(status_code=401, detail=f"invalid or expired session: {e}")
-    email = payload.get("email")
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"couldn't reach Supabase Auth to verify session: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=401, detail="invalid or expired session")
+    email = (resp.json() or {}).get("email")
     if not email:
-        raise HTTPException(status_code=401, detail="token is missing an email claim")
+        raise HTTPException(status_code=401, detail="Supabase user has no email on file")
     return email
 
 
